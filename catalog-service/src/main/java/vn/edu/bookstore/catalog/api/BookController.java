@@ -1,6 +1,9 @@
 package vn.edu.bookstore.catalog.api;
 
 import java.net.URI;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Sort;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.support.ServletUriComponentsBuilder;
@@ -11,6 +14,8 @@ import vn.edu.bookstore.catalog.api.model.BookPage;
 import vn.edu.bookstore.catalog.api.model.BookUpdateRequest;
 import vn.edu.bookstore.catalog.domain.BookEntity;
 import vn.edu.bookstore.catalog.service.BookService;
+import vn.edu.bookstore.catalog.service.PreconditionFailedException;
+import vn.edu.bookstore.catalog.service.PreconditionRequiredException;
 
 /** Hiện thực interface BooksApi sinh từ openapi.yaml (API-first). */
 @RestController
@@ -24,18 +29,30 @@ public class BookController implements BooksApi {
 
     @Override
     public ResponseEntity<BookPage> listBooks(String q, Integer page, Integer size, String sort) {
-        // TODO(TH2-4): đổi sort "title,asc" | "price,desc" | "publishedYear,asc" thành Sort
-        //   (price → thuộc tính priceAmount), tạo PageRequest.of(page, size, sort),
-        //   gọi service.list(q, pageable) và trả BookMapper.toPage(...)
-        throw new UnsupportedOperationException("TODO(TH2-4)");
+        // TH2-4: phân trang + sắp xếp theo tham số đã khai báo trong hợp đồng
+        return ResponseEntity.ok(BookMapper.toPage(service.list(q, PageRequest.of(page, size, toSort(sort)))));
+    }
+
+    static Sort toSort(String sort) {
+        String[] parts = sort.split(",");
+        String property = switch (parts[0]) {
+            case "price" -> "priceAmount";
+            case "publishedYear" -> "publishedYear";
+            default -> "title";
+        };
+        Sort.Direction dir = parts.length > 1 && parts[1].equals("desc") ? Sort.Direction.DESC : Sort.Direction.ASC;
+        return Sort.by(dir, property).and(Sort.by("isbn"));
     }
 
     @Override
     public ResponseEntity<Book> getBook(String isbn, String ifNoneMatch) {
         BookEntity e = service.get(isbn);
-        // TODO(TH2-5): tính ETag = BookMapper.etag(e); nếu If-None-Match khớp → 304 Not Modified;
-        //   ngược lại trả 200 kèm header ETag
-        return ResponseEntity.ok(BookMapper.toApi(e));
+        String etag = BookMapper.etag(e);
+        // TH2-5: ETag + If-None-Match -> 304
+        if (ifNoneMatch != null && matches(ifNoneMatch, etag)) {
+            return ResponseEntity.status(HttpStatus.NOT_MODIFIED).eTag(etag).build();
+        }
+        return ResponseEntity.ok().eTag(etag).body(BookMapper.toApi(e));
     }
 
     @Override
@@ -48,14 +65,36 @@ public class BookController implements BooksApi {
 
     @Override
     public ResponseEntity<Book> updateBook(String isbn, BookUpdateRequest request, String ifMatch) {
-        // TODO(TH2-5): thiếu If-Match → PreconditionRequiredException (428);
-        //   đọc số phiên bản trong If-Match ("3" → 3), gọi service.update(...), trả 200 kèm ETag mới
-        throw new UnsupportedOperationException("TODO(TH2-5)");
+        // TH2-5: If-Match bắt buộc; lệch phiên bản -> 412
+        if (ifMatch == null || ifMatch.isBlank()) {
+            throw new PreconditionRequiredException("Cần header If-Match chứa ETag đã đọc trước khi cập nhật");
+        }
+        BookEntity e = service.update(isbn, request, parseVersion(ifMatch));
+        return ResponseEntity.ok().eTag(BookMapper.etag(e)).body(BookMapper.toApi(e));
     }
 
     @Override
     public ResponseEntity<Void> deleteBook(String isbn) {
         service.delete(isbn);
         return ResponseEntity.noContent().build();
+    }
+
+    private static boolean matches(String header, String etag) {
+        for (String candidate : header.split(",")) {
+            String c = candidate.trim();
+            if (c.equals("*") || c.replaceFirst("^W/", "").equals(etag)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static long parseVersion(String ifMatch) {
+        String v = ifMatch.trim().replaceFirst("^W/", "").replace("\"", "");
+        try {
+            return Long.parseLong(v);
+        } catch (NumberFormatException ex) {
+            throw new PreconditionFailedException("If-Match không hợp lệ: " + ifMatch);
+        }
     }
 }
